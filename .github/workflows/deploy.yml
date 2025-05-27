@@ -42,6 +42,9 @@ jobs:
             ${{ vars.ECR_REPOSITORY_URI }}:latest
             ${{ vars.ECR_REPOSITORY_URI }}:${{ github.sha }}
 
+
+
+
       - name: Configure AWS credentials for ECS Region
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -55,7 +58,7 @@ jobs:
           echo "Task definition template downloaded as task-definition-template.json"
 
       - name: Render new task definition with updated image
-        id: render-task-def # 이 스텝의 ID
+        id: render-task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: task-definition-template.json
@@ -63,15 +66,31 @@ jobs:
           image: ${{ vars.ECR_REPOSITORY_URI }}:${{ github.sha }}
 
 
-      - name: Print new task definition file path (for debugging)
+      - name: Clean up rendered task definition for deployment
+        id: clean-task-def
         run: |
-          echo "Rendered task definition file is at: ${{ steps.render-task-def.outputs.task-definition }}"
-          cat ${{ steps.render-task-def.outputs.task-definition }}
+          RENDERED_TASK_DEF_FILE_PATH="${{ steps.render-task-def.outputs.task-definition }}"
+
+          jq 'del(.enableFaultInjection) | 
+              del(.taskDefinitionArn) | 
+              del(.revision) | 
+              del(.status) | 
+              del(.requiresAttributes) | 
+              del(.compatibilities) | 
+              del(.registeredAt) | 
+              del(.registeredBy) |
+              del(try .tags[])' \
+             "$RENDERED_TASK_DEF_FILE_PATH" > cleaned-task-definition.json
+
+          echo "Cleaned task definition saved to cleaned-task-definition.json"
+          cat cleaned-task-definition.json # 디버깅용
+
+          echo "cleaned_task_def_path=cleaned-task-definition.json" >> $GITHUB_OUTPUT
 
       - name: Deploy new task definition to Amazon ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1 # 또는 @v2
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          task-definition: ${{ steps.clean-task-def.outputs.cleaned_task_def_path }} # <--- 수정된 파일 경로 사용
           service: ${{ vars.ECS_SERVICE }}
           cluster: ${{ vars.ECS_CLUSTER }}
           wait-for-service-stability: true
