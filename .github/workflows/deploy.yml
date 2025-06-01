@@ -1,4 +1,4 @@
-name: CD - Deploy to Amazon ECS
+name: CD - Deploy to Amazon ECS with Zero Downtime (Scale Down/Up)
 
 on:
   push:
@@ -42,9 +42,6 @@ jobs:
             ${{ vars.ECR_REPOSITORY_URI }}:latest
             ${{ vars.ECR_REPOSITORY_URI }}:${{ github.sha }}
 
-
-
-
       - name: Configure AWS credentials for ECS Region
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -52,8 +49,27 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
           aws-region: ${{ vars.AWS_REGION }}
 
+      # --- New Steps for Scaling Down ---
+      - name: Scale ECS Service to zero
+        run: |
+          echo "Scaling down ECS service ${{ vars.ECS_SERVICE }} in cluster ${{ vars.ECS_CLUSTER }} to 0 desired tasks..."
+          aws ecs update-service \
+            --cluster ${{ vars.ECS_CLUSTER }} \
+            --service ${{ vars.ECS_SERVICE }} \
+            --desired-count 0
+
+      - name: Wait for service to scale down
+        run: |
+          echo "Waiting for service ${{ vars.ECS_SERVICE }} to stabilize at 0 running tasks..."
+          aws ecs wait services-stable \
+            --cluster ${{ vars.ECS_CLUSTER }} \
+            --service ${{ vars.ECS_SERVICE }}
+          echo "Service ${{ vars.ECS_SERVICE }} successfully scaled down and is stable."
+      # --- End of Scaling Down Steps ---
+
       - name: Download current task definition template
         run: |
+          echo "Downloading current task definition for family ${{ vars.ECS_TASK_DEFINITION_FAMILY }}..."
           aws ecs describe-task-definition --task-definition ${{ vars.ECS_TASK_DEFINITION_FAMILY }} --query taskDefinition > task-definition-template.json
           echo "Task definition template downloaded as task-definition-template.json"
 
@@ -65,33 +81,34 @@ jobs:
           container-name: ${{ vars.ECS_CONTAINER_NAME }}
           image: ${{ vars.ECR_REPOSITORY_URI }}:${{ github.sha }}
 
-
-      - name: Clean up rendered task definition for deployment
-        id: clean-task-def
+      - name: Print new task definition file path (for debugging)
         run: |
-          RENDERED_TASK_DEF_FILE_PATH="${{ steps.render-task-def.outputs.task-definition }}"
-
-          jq 'del(.enableFaultInjection) | 
-              del(.taskDefinitionArn) | 
-              del(.revision) | 
-              del(.status) | 
-              del(.requiresAttributes) | 
-              del(.compatibilities) | 
-              del(.registeredAt) | 
-              del(.registeredBy) |
-              del(try .tags[])' \
-             "$RENDERED_TASK_DEF_FILE_PATH" > cleaned-task-definition.json
-
-          echo "Cleaned task definition saved to cleaned-task-definition.json"
-          cat cleaned-task-definition.json # 디버깅용
-
-          echo "cleaned_task_def_path=cleaned-task-definition.json" >> $GITHUB_OUTPUT
+          echo "Rendered task definition file is at: ${{ steps.render-task-def.outputs.task-definition }}"
+          echo "Content of new task definition:"
+          cat ${{ steps.render-task-def.outputs.task-definition }}
 
       - name: Deploy new task definition to Amazon ECS
+        id: deploy-task
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          task-definition: ${{ steps.clean-task-def.outputs.cleaned_task_def_path }} # <--- 수정된 파일 경로 사용
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
           service: ${{ vars.ECS_SERVICE }}
           cluster: ${{ vars.ECS_CLUSTER }}
           wait-for-service-stability: true
           force-new-deployment: true
+
+      - name: Scale ECS Service to 1
+        run: |
+          echo "Scaling up ECS service ${{ vars.ECS_SERVICE }} in cluster ${{ vars.ECS_CLUSTER }} to 1 desired task..."
+          aws ecs update-service \
+            --cluster ${{ vars.ECS_CLUSTER }} \
+            --service ${{ vars.ECS_SERVICE }} \
+            --desired-count 1
+
+      - name: Wait for service to scale up and stabilize
+        run: |
+          echo "Waiting for service ${{ vars.ECS_SERVICE }} to scale up and stabilize with the new task definition..."
+          aws ecs wait services-stable \
+            --cluster ${{ vars.ECS_CLUSTER }} \
+            --service ${{ vars.ECS_SERVICE }}
+          echo "Service ${{ vars.ECS_SERVICE }} successfully scaled up and is stable with the new deployment."
